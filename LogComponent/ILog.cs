@@ -1,6 +1,6 @@
 ﻿namespace LogComponent
 {
-    public interface ILog
+    public interface ILog : IDisposable
     {
         /// <summary>
         /// Stop the logging. If any outstadning logs theses will not be written to Log

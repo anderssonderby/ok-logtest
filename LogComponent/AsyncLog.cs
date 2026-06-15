@@ -1,110 +1,147 @@
-﻿using System.Text;
+using System.Collections.Concurrent;
+using System.Text;
 
 namespace LogComponent
 {
     public class AsyncLog : ILog
     {
         private Thread _runThread;
-        private List<LogLine> _lines = new List<LogLine>();
+        private BlockingCollection<LogLine> _lines = new BlockingCollection<LogLine>();
 
-        private StreamWriter _writer; 
+        private readonly CancellationTokenSource _cancellation = new CancellationTokenSource();
 
-        private bool _exit;
+        private StreamWriter _writer = null!;
 
-        public AsyncLog()
+        // UTC calendar date of the file currently open; used to detect midnight rollover.
+        private DateTime _currentLogDate;
+
+        private readonly string _logDirectory;
+
+        // Injectable so tests can control time.
+        private readonly TimeProvider _timeProvider;
+
+        private bool _disposed;
+
+        public AsyncLog(string logDirectory = @"C:\LogTest", TimeProvider? timeProvider = null)
         {
-            if (!Directory.Exists(@"C:\LogTest")) 
-                Directory.CreateDirectory(@"C:\LogTest");
+            this._logDirectory = logDirectory;
+            this._timeProvider = timeProvider ?? TimeProvider.System;
 
-            this._writer = File.AppendText(@"C:\LogTest\Log" + DateTime.Now.ToString("yyyyMMdd HHmmss fff") + ".log");
-            
-            this._writer.Write("Timestamp".PadRight(25, ' ') + "\t" + "Data".PadRight(15, ' ') + "\t" + Environment.NewLine);
+            if (!Directory.Exists(this._logDirectory))
+                Directory.CreateDirectory(this._logDirectory);
 
-            this._writer.AutoFlush = true;
+            this.OpenNewFile(this._timeProvider.GetUtcNow().UtcDateTime);
 
             this._runThread = new Thread(this.MainLoop);
             this._runThread.Start();
         }
 
-        private bool _QuitWithFlush = false;
-
-
-        DateTime _curDate = DateTime.Now;
-
         private void MainLoop()
         {
-            while (!this._exit)
+            try
             {
-                if (this._lines.Count > 0)
+                // Blocks when the queue is empty and wakes the instant a line arrives.
+                // Completes when CompleteAdding() is called and the queue is drained, or
+                // throws OperationCanceledException when the token is cancelled.
+                foreach (LogLine logLine in this._lines.GetConsumingEnumerable(this._cancellation.Token))
                 {
-                    int f = 0;
-                    List<LogLine> _handled = new List<LogLine>();
-
-                    foreach (LogLine logLine in this._lines)
+                    try
                     {
-                        f++;
-
-                        if (f > 5)
-                            continue;
-                        
-                        if (!this._exit || this._QuitWithFlush)
+                        // Roll over to a new file when the line falls on a later UTC day
+                        // than the one the current file was opened for.
+                        if (logLine.Timestamp.Date != this._currentLogDate)
                         {
-                            _handled.Add(logLine);
-
-                            StringBuilder stringBuilder = new StringBuilder();
-
-                            if ((DateTime.Now - _curDate).Days != 0)
-                            {
-                                _curDate = DateTime.Now;
-
-                                this._writer = File.AppendText(@"C:\LogTest\Log" + DateTime.Now.ToString("yyyyMMdd HHmmss fff") + ".log");
-
-                                this._writer.Write("Timestamp".PadRight(25, ' ') + "\t" + "Data".PadRight(15, ' ') + "\t" + Environment.NewLine);
-
-                                stringBuilder.Append(Environment.NewLine);
-
-                                this._writer.Write(stringBuilder.ToString());
-
-                                this._writer.AutoFlush = true;
-                            }
-
-                            stringBuilder.Append(logLine.Timestamp.ToString("yyyy-MM-dd HH:mm:ss:fff"));
-                            stringBuilder.Append("\t");
-                            stringBuilder.Append(logLine.LineText());
-                            stringBuilder.Append("\t");
-
-                            stringBuilder.Append(Environment.NewLine);
-
-                            this._writer.Write(stringBuilder.ToString());
+                            this._writer.Dispose();
+                            this.OpenNewFile(logLine.Timestamp);
                         }
-                    }
 
-                    for (int y = 0; y < _handled.Count; y++)
+                        StringBuilder stringBuilder = new StringBuilder();
+
+                        stringBuilder.Append(logLine.Timestamp.ToString("yyyy-MM-dd HH:mm:ss:fff"));
+                        stringBuilder.Append("\t");
+                        stringBuilder.Append(logLine.LineText());
+                        stringBuilder.Append("\t");
+
+                        stringBuilder.Append(Environment.NewLine);
+
+                        this._writer.Write(stringBuilder.ToString());
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        this._lines.Remove(_handled[y]);   
+                        // Swallow per-line failures so one bad write can't crash the host
+                        // app; the filter lets cancellation through so shutdown still unwinds.
+                        // TODO: log this exception to a fallback sink (e.g. event log / stderr).
                     }
-
-                    if (this._QuitWithFlush == true && this._lines.Count == 0) 
-                        this._exit = true;
-
-                    Thread.Sleep(50);
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // StopWithoutFlush(): discard any lines still queued.
+            }
+        }
+
+        // The caller is responsible for disposing any previously open writer.
+        private void OpenNewFile(DateTime timestamp)
+        {
+            this._currentLogDate = timestamp.Date;
+
+            string fileName = "Log" + timestamp.ToString("yyyyMMdd HHmmss fff") + ".log";
+
+            this._writer = File.AppendText(Path.Combine(this._logDirectory, fileName));
+
+            this._writer.Write("Timestamp".PadRight(25, ' ') + "\t" + "Data".PadRight(15, ' ') + "\t" + Environment.NewLine);
+
+            this._writer.AutoFlush = true;
         }
 
         public void StopWithoutFlush()
         {
-            this._exit = true;
+            this._lines.CompleteAdding();
+            this._cancellation.Cancel();
+            this._runThread.Join();
+            this.Cleanup();
         }
 
         public void StopWithFlush()
         {
-            this._QuitWithFlush = true;
+            this._lines.CompleteAdding();
+            this._runThread.Join();
+            this.Cleanup();
         }
 
         public void Write(string text)
         {
-            this._lines.Add(new LogLine() { Text = text, Timestamp = DateTime.Now });
+            this._lines.Add(new LogLine() { Text = text, Timestamp = this._timeProvider.GetUtcNow().UtcDateTime });
+        }
+
+        public void Dispose()
+        {
+            // Make sure the worker has stopped before releasing resources. If neither
+            // Stop* was called, default to a flush so queued lines aren't silently lost.
+            if (!this._lines.IsAddingCompleted)
+                this._lines.CompleteAdding();
+
+            if (this._runThread.IsAlive)
+                this._runThread.Join();
+
+            this.Cleanup();
+
+            GC.SuppressFinalize(this);
+        }
+
+        // Releases the worker's resources. Safe to call multiple times and only
+        // ever runs after the worker thread has terminated, so there is no race
+        // on _writer.
+        private void Cleanup()
+        {
+            if (this._disposed)
+                return;
+
+            this._disposed = true;
+
+            this._writer.Dispose();
+            this._cancellation.Dispose();
+            this._lines.Dispose();
         }
     }
 }

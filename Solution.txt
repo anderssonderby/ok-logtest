@@ -1,0 +1,39 @@
+﻿Bugs:
+
+Plain List<LogLine> that the caller thread wrote to while the worker thread iterated and removed from it without synchronization. This could throw or corrupt state. Replaced with a
+thread-safe BlockingCollection<LogLine>.
+
+I don't know if this was deliberate, but busy-wait. The original loop processed only five lines per pass and when the queue was empty it looped indefinitely, potentially wasting resources.
+
+StopWithFlush did not actually flush. It set a flag and returned, so a caller could potentially exit before the flush completed. Replaced with CompleteAdding followed by Join, so it blocks until queue is drained and worker has stopped.
+
+StreamWriter was never disposed, and the day-rollover path reassigned the writer without closing the previous one. Added Disposal.
+
+Day-rollover logic was wrong (I assume). The original check measured elapsed twenty-four-hour periods rather than calendar day changes, so a logger started at 23:00 would not roll over at midnight. It now compares calendar dates and
+rolls over when a line falls on a later day.
+
+
+Refactors:
+
+The file-opening and header-writing logic was previously duplicated between the constructor and the rollover branch, was extracted into a single OpenNewFile helper. DRY vs WET.
+
+Log directory was previously hardcoded to C:\LogTest, changed to constructor parameter with that value as the default, backward compatibility while making the logger testable and configurable.
+
+All timestamps moved to UTC. The line timestamps, file names, and the rollover date comparison all use a single clock source.
+
+A generic per-line exception guard was added inside the worker loop so that a failed write cannot tear down the worker thread and crash the host;
+
+
+Architectural decisions:
+
+Producer/consumer via BlockingCollection. Chosen to solve thread safety, idle CPU, and latency together. CompleteAdding fits well with the flush-then-stop requirement, since you can mark the BlockingCollection instance as not accepting any more entities.
+
+CancellationToken for the StopWithoutFlush requirement. Cancelling makes the enumerator throw OperationCanceledException, which is caught, abandoning any queued loglines. StopWithFlush does not cancel, so the queue drains first.
+
+Rollover based off of line timestamp rather than duration-based processing.
+
+Added Clock injection via TimeProvider. Pragmatic / quick way to make the day-rollover behavior testable without adding a ton of code.
+
+IDisposable on the ILog interface makes disposal available through the interface.
+
+Caught errors to make sure that the log component should not be able to crash it's host process. Silent error "swallowing" should be handled.
